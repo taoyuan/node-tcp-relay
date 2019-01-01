@@ -21,23 +21,7 @@ function RelayServer(relayPort, internetPort, options) {
     this.options = options || {};
     this.relayPort = relayPort;
     this.internetPort = internetPort;
-    this.relayListener = new Listener(relayPort, {
-        hostname: options.hostname,
-        secret: options.secret,
-        bufferData: options.secret ? true : false,
-        tls: options.tls !== false ? true : false,
-        pfx: options.pfx,
-        passphrase: options.passphrase
-    });
-    this.internetListener = new Listener(internetPort, {
-        hostname: options.hostname,
-        bufferData: true,
-        timeout: 20000,
-        tls: options.tls === "both" ? true : false,
-        pfx: options.pfx,
-        passphrase: options.passphrase
-    });
-
+    this.createListeners();
     var server = this;
     this.relayListener.on("new", function(client) {
         server.internetListener.pair(server.relayListener, client);
@@ -46,6 +30,27 @@ function RelayServer(relayPort, internetPort, options) {
         server.relayListener.pair(server.internetListener, client);
     });
 }
+
+RelayServer.prototype.createListeners = function() {
+    this.relayTlsOptions = makeRelayTlsOptions(this.options);
+    this.relayListener = new Listener(this.relayPort, {
+        hostname: this.options.hostname,
+        tls: this.options.tls !== false ? true : false,
+        pfx: this.options.pfx,
+        passphrase: this.options.passphrase,
+        tlsOptions: this.relayTlsOptions
+    });
+    this.internetTlsOptions = makeInternetTlsOptions(this.options);
+    this.internetListener = new Listener(this.internetPort, {
+        hostname: this.options.hostname,
+        bufferData: true,
+        timeout: 20000,
+        tls: this.options.tls === "both" ? true : false,
+        pfx: this.options.pfx,
+        passphrase: this.options.passphrase,
+        tlsOptions: this.internetTlsOptions
+    });
+};
 
 RelayServer.prototype.end = function() {
     this.relayListener.end();
@@ -59,14 +64,9 @@ function Listener(port, options) {
     this.options = options || {};
     this.pending = [];
     this.active = [];
-
     var listener = this;
-    if (listener.options.tls === true) {
-        var tlsOptions = {
-            pfx: fs.readFileSync(listener.options.pfx),
-            passphrase: listener.options.passphrase
-        };
-        this.server = tls.createServer(tlsOptions, function(socket) {
+    if (options.tls === true) {
+        this.server = tls.createServer(options.tlsOptions, function(socket) {
             listener.createClient(socket);
         });
     } else {
@@ -77,45 +77,66 @@ function Listener(port, options) {
     this.server.listen(port, options.hostname);
 }
 
+function makeRelayTlsOptions(options) {
+    var tlsOptions = {
+        pfx: fs.readFileSync(options.pfx),
+        passphrase: options.passphrase,
+        secureProtocol: "TLSv1_2_method"
+    };
+    if (options.auth) {
+        tlsOptions.requestCert = true;
+    }
+    if (options.caFile) {
+        tlsOptions.ca = fs.readFileSync(options.caFile);
+    }
+    return tlsOptions;
+}
+
+function makeInternetTlsOptions(options) {
+    var tlsOptions = {
+        pfx: fs.readFileSync(options.pfx),
+        passphrase: options.passphrase,
+        secureProtocol: "TLSv1_2_method"
+    };
+    return tlsOptions;
+}
+
 Listener.prototype.createClient = function(socket) {
-    var listener = this;
     var client = new Client(socket, {
-        secret: listener.options.secret,
-        bufferData: listener.options.bufferData,
-        timeout: listener.options.timeout
+        bufferData: this.options.bufferData,
+        timeout: this.options.timeout
     });
+    var listener = this;
     client.on("close", function() {
-        var i = listener.pending.indexOf(client);
-        if (i != -1) {
-            listener.pending.splice(i, 1);
-        } else {
-            i = listener.active.indexOf(client);
-            if (i != -1) {
-                listener.active.splice(i, 1);
-            }
-        }
+        listener.handleClose(client);
     });
-    if (listener.options.secret) {
-        client.on("authorized", function() {
-            listener.emit("new", client);
-        });
+    listener.emit("new", client);
+};
+
+Listener.prototype.handleClose = function(client) {
+    var i = this.pending.indexOf(client);
+    if (i != -1) {
+        this.pending.splice(i, 1);
     } else {
-        listener.emit("new", client);
+        i = this.active.indexOf(client);
+        if (i != -1) {
+            this.active.splice(i, 1);
+        }
     }
 };
 
 Listener.prototype.end = function() {
     this.server.close();
-    for (var i = 0; i < this.pending.length; i++) {
-        var client = this.pending[i];
-        client.socket.destroy();
-    }
-    for (var i = 0; i < this.active.length; i++) {
-        var client = this.active[i];
-        client.socket.destroy();
-    }
+    destroyAllSockets(this.pending);
+    destroyAllSockets(this.active);
     this.server.unref();
 };
+
+function destroyAllSockets(arr) {
+    for (var i = 0; i < arr.length; i++) {
+        arr[i].socket.destroy();
+    }
+}
 
 Listener.prototype.pair = function(other, client) {
     if (this.pending.length > 0) {
@@ -144,27 +165,34 @@ function Client(socket, options) {
     this.timeout();
 
     var client = this;
-    client.socket.on("data", function(data) {
-        if (client.options.bufferData) {
-            client.buffer[client.buffer.length] = data;
-            client.authorize();
-            return;
-        }
-        try {
-            client.pairedSocket.write(data);
-        } catch (ex) {
-        }
+    socket.on("data", function(data) {
+        client.receiveData(data);
     });
     socket.on("close", function(hadError) {
-        if (client.pairedSocket != undefined) {
-            client.pairedSocket.destroy();
-        }
-        client.emit("close");
+        client.handleClose(hadError);
     });
     socket.on("error", function(err) {
       client.emit("close");
     });
 }
+
+Client.prototype.receiveData = function(data) {
+    if (this.options.bufferData) {
+        this.buffer[this.buffer.length] = data;
+        return;
+    }
+    try {
+        this.pairedSocket.write(data);
+    } catch (ex) {
+    }
+};
+
+Client.prototype.handleClose = function(hadError) {
+    if (this.pairedSocket != undefined) {
+        this.pairedSocket.destroy();
+    }
+    this.emit("close");
+};
 
 Client.prototype.timeout = function() {
     var client = this;
@@ -177,21 +205,6 @@ Client.prototype.timeout = function() {
             client.emit("close");
         }
     }, client.options.timeout);
-};
-
-Client.prototype.authorize = function() {
-    var client = this;
-    if (client.options.secret) {
-        var keyLen = client.options.secret.length;
-        if (client.buffer[0].length >= keyLen
-            && client.buffer[0].toString(undefined, 0, keyLen)
-            === client.options.secret) {
-            client.buffer[0] = client.buffer[0].slice(keyLen);
-            client.emit("authorized");
-        } else {
-            client.socket.destroy();
-        }
-    }
 };
 
 Client.prototype.writeBuffer = function() {
